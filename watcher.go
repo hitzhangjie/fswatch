@@ -5,13 +5,16 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
 // Watcher represents a file system watcher. It should be initialised
 // with NewWatcher or NewAutoWatcher, and started with Watcher.Start().
 type Watcher struct {
-	paths      map[string]*watchItem
+	mu    *sync.RWMutex
+	paths map[string]*watchItem
+
 	chnotify   chan *FileEvent
 	chadd      chan *watchItem
 	autoWatch  bool
@@ -38,6 +41,7 @@ func NewWatcher(paths []string, opts ...Option) *Watcher {
 // newWatcher is the internal function for properly setting up a new watcher.
 func newWatcher(opts *options) (w *Watcher) {
 	w = new(Watcher)
+	w.mu = &sync.RWMutex{}
 	w.autoWatch = opts.autoWatch
 	w.paths = make(map[string]*watchItem, 0)
 	w.ignoreFunc = defaultIgnoreFunc
@@ -53,9 +57,11 @@ func newWatcher(opts *options) (w *Watcher) {
 	if opts.autoWatch {
 		w.syncAddPaths(paths...)
 	} else {
+		w.mu.Lock()
 		for _, path := range paths {
 			w.paths[path] = watchPath(path)
 		}
+		w.mu.Unlock()
 	}
 	return
 }
@@ -93,7 +99,10 @@ func (w *Watcher) Stop() {
 
 // Active returns true if the Watcher is actively looking for changes.
 func (w *Watcher) Active() bool {
-	return w.paths != nil && len(w.paths) > 0
+	w.mu.RLock()
+	ok := w.paths != nil && len(w.paths) > 0
+	w.mu.RUnlock()
+	return ok
 }
 
 // Add method takes a variable number of string arguments and adds those
@@ -115,9 +124,11 @@ func (w *Watcher) Add(inpaths ...string) {
 	} else if w.autoWatch {
 		w.syncAddPaths(paths...)
 	} else {
+		w.mu.Lock()
 		for _, path := range paths {
 			w.paths[path] = watchPath(path)
 		}
+		w.mu.Unlock()
 	}
 }
 
@@ -130,6 +141,7 @@ func (w *Watcher) watch(sndch chan<- *FileEvent) {
 	for {
 		<-time.After(WatchDelay)
 
+		w.mu.Lock()
 		for _, wi := range w.paths {
 			if wi.Update() && w.shouldNotify(wi) {
 				sndch <- wi.Next()
@@ -143,6 +155,7 @@ func (w *Watcher) watch(sndch chan<- *FileEvent) {
 				w.Stop()
 			}
 		}
+		w.mu.Unlock()
 	}
 }
 
@@ -168,10 +181,15 @@ func (w *Watcher) watchItemListener() {
 		wi := <-w.chadd
 		if wi == nil {
 			continue
-		} else if _, watching := w.paths[wi.Path]; watching {
+		}
+
+		w.mu.Lock()
+		_, watching := w.paths[wi.Path]
+		if watching {
 			continue
 		}
 		w.paths[wi.Path] = wi
+		w.mu.Unlock()
 	}
 }
 
@@ -199,7 +217,9 @@ func getWalker(w *Watcher, root string, addch chan<- *watchItem) func(string, os
 		if wi == nil {
 			return nil
 		}
+		w.mu.RLock()
 		_, watching := w.paths[wi.Path]
+		w.mu.RUnlock()
 		if watching {
 			return nil
 		}
@@ -230,10 +250,17 @@ func (w *Watcher) syncAddPaths(paths ...string) {
 			continue
 		} else if wi.LastEvent == NOEXIST {
 			continue
-		} else if _, watching := w.paths[wi.Path]; watching {
-			continue
+		} else {
+			w.mu.RLock()
+			_, watching := w.paths[wi.Path]
+			w.mu.RUnlock()
+			if watching {
+				continue
+			}
 		}
+		w.mu.Lock()
 		w.paths[wi.Path] = wi
+		w.mu.Unlock()
 		if wi.StatInfo.IsDir() {
 			w.syncAddDir(wi)
 		}
@@ -256,11 +283,16 @@ func (w *Watcher) syncAddDir(wi *watchItem) {
 		}
 		newWI := watchPath(path)
 		if newWI != nil {
+			w.mu.Lock()
 			w.paths[path] = newWI
 			if !newWI.StatInfo.IsDir() {
+				w.mu.Unlock()
 				return nil
 			}
-			if _, watching := w.paths[newWI.Path]; !watching {
+			w.mu.RLock()
+			_, watching := w.paths[newWI.Path]
+			w.mu.RUnlock()
+			if !watching {
 				w.syncAddDir(newWI)
 			}
 		}
@@ -272,15 +304,20 @@ func (w *Watcher) syncAddDir(wi *watchItem) {
 // Watching returns a list of the files being watched.
 func (w *Watcher) Watching() (paths []string) {
 	paths = make([]string, 0)
+	w.mu.RLock()
 	for path := range w.paths {
 		paths = append(paths, path)
 	}
+	w.mu.RUnlock()
 	return
 }
 
 // State returns a slice of Notifications representing the files being watched
 // and their last event.
 func (w *Watcher) State() (state []FileEvent) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
 	state = make([]FileEvent, 0)
 	if w.paths == nil {
 		return
