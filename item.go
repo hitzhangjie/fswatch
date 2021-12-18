@@ -72,3 +72,8 @@ func (wi *watchItem) Update() bool {
 	}
 	return false
 }
+
+// Next returns a new event from a watchItem.
+func (wi *watchItem) Next() *FileEvent {
+	return &FileEvent{wi.Path, wi.LastEvent}
+}

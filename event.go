@@ -27,11 +27,6 @@ type FileEvent struct {
 	Event int
 }
 
-// FileEvent returns a notification from a watchItem.
-func (wi *watchItem) Notification() *FileEvent {
-	return &FileEvent{wi.Path, wi.LastEvent}
-}
-
 // FileEventsBufferLen is the number of notifications that should be buffered
 // in the channel.
 var FileEventsBufferLen = 16

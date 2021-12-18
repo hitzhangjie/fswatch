@@ -1,6 +1,7 @@
 package fswatch
 
 import (
+	"context"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -11,10 +12,12 @@ import (
 // with NewWatcher or NewAutoWatcher, and started with Watcher.Start().
 type Watcher struct {
 	paths      map[string]*watchItem
-	cnotify    chan *FileEvent
-	cadd       chan *watchItem
+	chnotify   chan *FileEvent
+	chadd      chan *watchItem
 	autoWatch  bool
 	ignoreFunc IgnoreFunc
+
+	chdone chan struct{}
 }
 
 // NewWatcher initialises a new Watcher with an initial set of paths.
@@ -60,26 +63,31 @@ func newWatcher(opts *options) (w *Watcher) {
 // Start begins watching the files, sending notifications when files change.
 // It returns a channel that notifications are sent on.
 func (w *Watcher) Start() <-chan *FileEvent {
-	if w.cnotify != nil {
-		return w.cnotify
+	if w.chnotify != nil {
+		return w.chnotify
 	}
 	if w.autoWatch {
-		w.cadd = make(chan *watchItem, FileEventsBufferLen)
+		w.chadd = make(chan *watchItem, FileEventsBufferLen)
 		go w.watchItemListener()
 	}
-	w.cnotify = make(chan *FileEvent, FileEventsBufferLen)
-	go w.watch(w.cnotify)
-	return w.cnotify
+	w.chnotify = make(chan *FileEvent, FileEventsBufferLen)
+	w.chdone = make(chan struct{})
+	go w.watch(w.chnotify)
+	return w.chnotify
 }
 
 // Stop listening for changes to the files.
 func (w *Watcher) Stop() {
-	if w.cnotify != nil {
-		close(w.cnotify)
+	if w.chdone != nil {
+		close(w.chdone)
 	}
 
-	if w.cadd != nil {
-		close(w.cadd)
+	if w.chnotify != nil {
+		w.chnotify = nil
+	}
+
+	if w.chadd != nil {
+		w.chadd = nil
 	}
 }
 
@@ -99,7 +107,7 @@ func (w *Watcher) Add(inpaths ...string) {
 		}
 		paths = append(paths, matches...)
 	}
-	if w.autoWatch && w.cnotify != nil {
+	if w.autoWatch && w.chnotify != nil {
 		for _, path := range paths {
 			wi := watchPath(path)
 			w.addPaths(wi)
@@ -124,7 +132,7 @@ func (w *Watcher) watch(sndch chan<- *FileEvent) {
 
 		for _, wi := range w.paths {
 			if wi.Update() && w.shouldNotify(wi) {
-				sndch <- wi.Notification()
+				sndch <- wi.Next()
 			}
 
 			if wi.LastEvent == NOEXIST && w.autoWatch {
@@ -148,7 +156,7 @@ func (w *Watcher) shouldNotify(wi *watchItem) bool {
 }
 
 func (w *Watcher) addPaths(wi *watchItem) {
-	walker := getWalker(w, wi.Path, w.cadd)
+	walker := getWalker(w, wi.Path, w.chadd)
 	go filepath.Walk(wi.Path, walker)
 }
 
@@ -157,7 +165,7 @@ func (w *Watcher) watchItemListener() {
 		recover()
 	}()
 	for {
-		wi := <-w.cadd
+		wi := <-w.chadd
 		if wi == nil {
 			continue
 		} else if _, watching := w.paths[wi.Path]; watching {
@@ -169,14 +177,20 @@ func (w *Watcher) watchItemListener() {
 
 func getWalker(w *Watcher, root string, addch chan<- *watchItem) func(string, os.FileInfo, error) error {
 	walker := func(path string, info fs.FileInfo, err error) error {
+		// if watcher is stopped, do nothing
+		if w.Stopped() {
+			return nil
+		}
+
+		// if path is ignored, do nothing
+		if err != nil {
+			return err
+		}
 		if w.ignoreFunc(path) {
 			if info.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
-		}
-		if err != nil {
-			return err
 		}
 		if path == root {
 			return nil
@@ -184,13 +198,21 @@ func getWalker(w *Watcher, root string, addch chan<- *watchItem) func(string, os
 		wi := watchPath(path)
 		if wi == nil {
 			return nil
-		} else if _, watching := w.paths[wi.Path]; !watching {
-			wi.LastEvent = CREATED
-			w.cnotify <- wi.Notification()
-			addch <- wi
-			if !wi.StatInfo.IsDir() {
-				return nil
-			}
+		}
+		_, watching := w.paths[wi.Path]
+		if watching {
+			return nil
+		}
+
+		wi.LastEvent = CREATED
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer cancel()
+
+		w.trySendEvent(ctx, wi.Next())
+		w.tryWatchItem(ctx, wi)
+
+		if wi.StatInfo.IsDir() {
 			w.addPaths(wi)
 		}
 		return nil
@@ -264,7 +286,34 @@ func (w *Watcher) State() (state []FileEvent) {
 		return
 	}
 	for _, wi := range w.paths {
-		state = append(state, *wi.Notification())
+		state = append(state, *wi.Next())
 	}
 	return
+}
+
+func (w *Watcher) Stopped() bool {
+	select {
+	case <-w.chdone:
+		return true
+	default:
+		return false
+	}
+}
+
+func (w *Watcher) trySendEvent(ctx context.Context, ev *FileEvent) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case w.chnotify <- ev:
+		return true
+	}
+}
+
+func (w *Watcher) tryWatchItem(ctx context.Context, item *watchItem) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case w.chadd <- item:
+		return true
+	}
 }
