@@ -2,7 +2,6 @@ package fswatch
 
 import (
 	"context"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -194,7 +193,7 @@ func (w *Watcher) watchItemListener() {
 }
 
 func getWalker(w *Watcher, root string, addch chan<- *watchItem) func(string, os.FileInfo, error) error {
-	walker := func(path string, info fs.FileInfo, err error) error {
+	walker := func(path string, info os.FileInfo, err error) error {
 		// if watcher is stopped, do nothing
 		if w.Stopped() {
 			return nil
