@@ -2,24 +2,27 @@ package fswatch
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // Watcher represents a file system watcher. It should be initialised
 // with NewWatcher or NewAutoWatcher, and started with Watcher.Start().
 type Watcher struct {
-	mu    *sync.RWMutex
-	paths map[string]*watchItem
+	paths *sync.Map // key=path,val=watchItem
+	count int64     // count elements in paths
 
-	chnotify   chan *FileEvent
-	chadd      chan *watchItem
-	autoWatch  bool
-	ignoreFunc IgnoreFunc
+	chnotify   chan *FileEvent // chan that notifies users happenning events
+	chadd      chan *watchItem // chan that transfer newly created files
+	autoWatch  bool            // whether automatically watch the files underneatch, including newly created files
+	ignoreFunc IgnoreFunc      // customized function that determine whether specific path should be skipped
 
-	chdone chan struct{}
+	chdone chan struct{} // chan that notifies this watcher is stopped, so all watchItem should be cleared
 }
 
 // NewWatcher initialises a new Watcher with an initial set of paths.
@@ -39,30 +42,31 @@ func NewWatcher(paths []string, opts ...Option) *Watcher {
 
 // newWatcher is the internal function for properly setting up a new watcher.
 func newWatcher(opts *options) (w *Watcher) {
-	w = new(Watcher)
-	w.mu = &sync.RWMutex{}
-	w.autoWatch = opts.autoWatch
-	w.paths = make(map[string]*watchItem, 0)
-	w.ignoreFunc = defaultIgnoreFunc
+	w = &Watcher{
+		paths:      &sync.Map{},
+		autoWatch:  opts.autoWatch,
+		ignoreFunc: defaultIgnoreFunc,
+	}
 
+	// autowatch implies recursivly watching
 	var paths []string
-	for _, path := range opts.paths {
-		matches, err := filepath.Glob(path)
+	for _, p := range opts.paths {
+		matches, err := filepath.Glob(p)
 		if err != nil {
 			continue
 		}
 		paths = append(paths, matches...)
 	}
+
 	if opts.autoWatch {
 		w.syncAddPaths(paths...)
-	} else {
-		w.mu.Lock()
-		for _, path := range paths {
-			w.paths[path] = watchPath(path)
-		}
-		w.mu.Unlock()
+		return w
 	}
-	return
+
+	for _, path := range paths {
+		w.paths.Store(path, newWatchItem(path))
+	}
+	return w
 }
 
 // Start begins watching the files, sending notifications when files change.
@@ -77,7 +81,9 @@ func (w *Watcher) Start() <-chan *FileEvent {
 	}
 	w.chnotify = make(chan *FileEvent, FileEventsBufferLen)
 	w.chdone = make(chan struct{})
+
 	go w.watch(w.chnotify)
+
 	return w.chnotify
 }
 
@@ -98,37 +104,40 @@ func (w *Watcher) Stop() {
 
 // Active returns true if the Watcher is actively looking for changes.
 func (w *Watcher) Active() bool {
-	w.mu.RLock()
-	ok := w.paths != nil && len(w.paths) > 0
-	w.mu.RUnlock()
-	return ok
+	return atomic.LoadInt64(&w.count) > 0
 }
 
 // Add method takes a variable number of string arguments and adds those
 // files to the watch list, returning the number of files added.
-func (w *Watcher) Add(inpaths ...string) {
-	var paths []string
-	for _, path := range inpaths {
-		matches, err := filepath.Glob(path)
+func (w *Watcher) Add(paths ...string) {
+	if w.stopped() {
+		panic("watcher already stopped")
+	}
+
+	var pp []string
+	for _, p := range paths {
+		matches, err := filepath.Glob(p)
 		if err != nil {
 			continue
 		}
-		paths = append(paths, matches...)
+		pp = append(pp, matches...)
 	}
-	if w.autoWatch && w.chnotify != nil {
-		for _, path := range paths {
-			wi := watchPath(path)
-			w.addPaths(wi)
+
+	if !w.autoWatch {
+		for _, p := range pp {
+			w.paths.Store(p, newWatchItem(p))
 		}
-	} else if w.autoWatch {
-		w.syncAddPaths(paths...)
-	} else {
-		w.mu.Lock()
-		for _, path := range paths {
-			w.paths[path] = watchPath(path)
-		}
-		w.mu.Unlock()
 	}
+
+	if w.chnotify != nil {
+		for _, p := range pp {
+			wi := newWatchItem(p)
+			w.addWatchItem(wi)
+		}
+		return
+	}
+	w.syncAddPaths(pp...)
+	return
 }
 
 // goroutine that cycles through the list of paths and checks for updates.
@@ -140,62 +149,58 @@ func (w *Watcher) watch(sndch chan<- *FileEvent) {
 	for {
 		<-time.After(WatchDelay)
 
-		w.mu.Lock()
-		for _, wi := range w.paths {
+		w.paths.Range(func(key, value interface{}) bool {
+			wi := value.(*watchItem)
+
 			if wi.Update() && w.shouldNotify(wi) {
 				sndch <- wi.Next()
 			}
 
-			if wi.LastEvent == NOEXIST && w.autoWatch {
-				delete(w.paths, wi.Path)
+			if wi.LastEvent == NOTEXIST && w.autoWatch {
+				w.paths.Delete(wi.Path)
 			}
 
-			if len(w.paths) == 0 {
-				w.Stop()
-			}
-		}
-		w.mu.Unlock()
+			return true
+		})
 	}
 }
 
 func (w *Watcher) shouldNotify(wi *watchItem) bool {
 	if w.autoWatch && wi.StatInfo.IsDir() &&
-		!(wi.LastEvent == DELETED || wi.LastEvent == NOEXIST) {
-		go w.addPaths(wi)
+		!(wi.LastEvent == DELETED || wi.LastEvent == NOTEXIST) {
+		go w.addWatchItem(wi)
 		return false
 	}
 	return true
 }
 
-func (w *Watcher) addPaths(wi *watchItem) {
+func (w *Watcher) addWatchItem(wi *watchItem) {
 	walker := getWalker(w, wi.Path, w.chadd)
 	go filepath.Walk(wi.Path, walker)
 }
 
 func (w *Watcher) watchItemListener() {
 	defer func() {
-		recover()
+		if e := recover(); e != nil {
+			buf := make([]byte, 1024)
+			n := runtime.Stack(buf, false)
+			fmt.Fprintf(os.Stderr, "watch item panic: %s", string(buf[:n]))
+		}
 	}()
+
 	for {
 		wi := <-w.chadd
 		if wi == nil {
 			continue
 		}
-
-		w.mu.Lock()
-		_, watching := w.paths[wi.Path]
-		if watching {
-			continue
-		}
-		w.paths[wi.Path] = wi
-		w.mu.Unlock()
+		w.paths.LoadOrStore(wi.Path, wi)
 	}
 }
 
 func getWalker(w *Watcher, root string, addch chan<- *watchItem) func(string, os.FileInfo, error) error {
 	walker := func(path string, info os.FileInfo, err error) error {
 		// if watcher is stopped, do nothing
-		if w.Stopped() {
+		if w.stopped() {
 			return nil
 		}
 
@@ -212,13 +217,12 @@ func getWalker(w *Watcher, root string, addch chan<- *watchItem) func(string, os
 		if path == root {
 			return nil
 		}
-		wi := watchPath(path)
+		wi := newWatchItem(path)
 		if wi == nil {
 			return nil
 		}
-		w.mu.RLock()
-		_, watching := w.paths[wi.Path]
-		w.mu.RUnlock()
+
+		_, watching := w.paths.Load(wi.Path)
 		if watching {
 			return nil
 		}
@@ -232,7 +236,7 @@ func getWalker(w *Watcher, root string, addch chan<- *watchItem) func(string, os
 		w.tryWatchItem(ctx, wi)
 
 		if wi.StatInfo.IsDir() {
-			w.addPaths(wi)
+			w.addWatchItem(wi)
 		}
 		return nil
 	}
@@ -241,25 +245,29 @@ func getWalker(w *Watcher, root string, addch chan<- *watchItem) func(string, os
 
 func (w *Watcher) syncAddPaths(paths ...string) {
 	for _, path := range paths {
+		// ignore if needed
 		if w.ignoreFunc(path) {
 			continue
 		}
-		wi := watchPath(path)
+
+		// ignore if already watched
+		_, watching := w.paths.Load(path)
+		if watching {
+			continue
+		}
+
+		// build new watchItem
+		wi := newWatchItem(path)
 		if wi == nil {
 			continue
-		} else if wi.LastEvent == NOEXIST {
-			continue
-		} else {
-			w.mu.RLock()
-			_, watching := w.paths[wi.Path]
-			w.mu.RUnlock()
-			if watching {
-				continue
-			}
 		}
-		w.mu.Lock()
-		w.paths[wi.Path] = wi
-		w.mu.Unlock()
+		if wi.LastEvent == NOTEXIST {
+			continue
+		}
+
+		w.paths.Store(wi.Path, wi)
+
+		// add files underneath
 		if wi.StatInfo.IsDir() {
 			w.syncAddDir(wi)
 		}
@@ -271,6 +279,10 @@ func (w *Watcher) syncAddDir(wi *watchItem) {
 		if err != nil {
 			return err
 		}
+		if !info.IsDir() {
+			return nil
+		}
+		// ignore if needed
 		if w.ignoreFunc(path) {
 			if info.IsDir() {
 				return filepath.SkipDir
@@ -280,20 +292,17 @@ func (w *Watcher) syncAddDir(wi *watchItem) {
 		if path == wi.Path {
 			return nil
 		}
-		newWI := watchPath(path)
-		if newWI != nil {
-			w.mu.Lock()
-			w.paths[path] = newWI
-			if !newWI.StatInfo.IsDir() {
-				w.mu.Unlock()
-				return nil
-			}
-			w.mu.RLock()
-			_, watching := w.paths[newWI.Path]
-			w.mu.RUnlock()
-			if !watching {
-				w.syncAddDir(newWI)
-			}
+
+		// build new watchItem
+		wi := newWatchItem(path)
+		if wi == nil {
+			return nil
+		}
+		w.paths.Store(path, wi)
+
+		_, watching := w.paths.Load(wi.Path)
+		if !watching {
+			w.syncAddDir(wi)
 		}
 		return nil
 	}
@@ -301,35 +310,38 @@ func (w *Watcher) syncAddDir(wi *watchItem) {
 }
 
 // Watching returns a list of the files being watched.
-func (w *Watcher) Watching() (paths []string) {
-	paths = make([]string, 0)
-	w.mu.RLock()
-	for path := range w.paths {
-		paths = append(paths, path)
-	}
-	w.mu.RUnlock()
-	return
+func (w *Watcher) Watching() []string {
+	paths := make([]string, 0)
+
+	w.paths.Range(func(key, val interface{}) bool {
+		paths = append(paths, key.(string))
+		return true
+	})
+	return paths
 }
 
 // State returns a slice of Notifications representing the files being watched
 // and their last event.
-func (w *Watcher) State() (state []FileEvent) {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-
-	state = make([]FileEvent, 0)
+func (w *Watcher) State() []FileEvent {
+	states := []FileEvent{}
 	if w.paths == nil {
-		return
+		return nil
 	}
-	for _, wi := range w.paths {
-		state = append(state, *wi.Next())
-	}
-	return
+	w.paths.Range(func(key, val interface{}) bool {
+		states = append(states, *(val.(*watchItem).Next()))
+		return false
+	})
+	return states
 }
 
-func (w *Watcher) Stopped() bool {
+// Done returns whether this watcher stopped
+func (w *Watcher) Done() <-chan struct{} {
+	return w.chdone
+}
+
+func (w *Watcher) stopped() bool {
 	select {
-	case <-w.chdone:
+	case <-w.Done():
 		return true
 	default:
 		return false
@@ -338,6 +350,8 @@ func (w *Watcher) Stopped() bool {
 
 func (w *Watcher) trySendEvent(ctx context.Context, ev *FileEvent) bool {
 	select {
+	case <-w.chdone:
+		return false
 	case <-ctx.Done():
 		return false
 	case w.chnotify <- ev:
@@ -347,6 +361,8 @@ func (w *Watcher) trySendEvent(ctx context.Context, ev *FileEvent) bool {
 
 func (w *Watcher) tryWatchItem(ctx context.Context, item *watchItem) bool {
 	select {
+	case <-w.chdone:
+		return false
 	case <-ctx.Done():
 		return false
 	case w.chadd <- item:

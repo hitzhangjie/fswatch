@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/hitzhangjie/fswatch"
 )
@@ -18,6 +19,7 @@ func TestWatcher(t *testing.T) {
 
 	w := fswatch.NewWatcher([]string{dir}, fswatch.WithAutoWatch(true))
 	events := w.Start()
+	_ = events
 
 	go func() {
 		// create directory $dir/a/b/, $dir/m/n
@@ -29,13 +31,25 @@ func TestWatcher(t *testing.T) {
 		// create file $dir/m/n/main.c
 		os.MkdirAll(filepath.Join(dir, "m/n"), os.ModePerm)
 
+		time.Sleep(time.Second * 2)
 		w.Stop()
 	}()
 
-	for evt := range events {
+	var vals []string
+LOOP:
+	for {
+		var evt *fswatch.FileEvent
+		select {
+		case evt = <-events:
+		case <-w.Done():
+			fmt.Println("stopped")
+			break LOOP
+		}
+
 		switch evt.Event {
 		case fswatch.CREATED:
 			fmt.Println("created:", evt.Path)
+			vals = append(vals, evt.Path)
 		case fswatch.MODIFIED:
 			fmt.Println("modified:", evt.Path)
 		case fswatch.DELETED:
@@ -47,6 +61,9 @@ func TestWatcher(t *testing.T) {
 		}
 	}
 
+	if len(vals) != 4 {
+		t.Errorf("expected len = 3, got = %d", len(vals))
+	}
 }
 
 func setupTestEnv() (string, error) {

@@ -14,7 +14,7 @@ const (
 	DELETED         // File was deleted.
 	MODIFIED        // File was modified.
 	PERM            // Changed permissions
-	NOEXIST         // File does not exist.
+	NOTEXIST        // File does not exist.
 	NOPERM          // No permissions for the file (see const block comment).
 	INVALID         // Any type of error not represented above.
 )

@@ -2,22 +2,23 @@ package fswatch
 
 import "os"
 
-func watchPath(path string) (wi *watchItem) {
-	wi = new(watchItem)
-	wi.Path = path
-	wi.LastEvent = NONE
+func newWatchItem(path string) *watchItem {
+	wi := &watchItem{
+		Path:      path,
+		LastEvent: NONE,
+	}
 
 	fi, err := os.Stat(path)
 	if err == nil {
 		wi.StatInfo = fi
 	} else if os.IsNotExist(err) {
-		wi.LastEvent = NOEXIST
+		wi.LastEvent = NOTEXIST
 	} else if os.IsPermission(err) {
 		wi.LastEvent = NOPERM
 	} else {
 		wi.LastEvent = INVALID
 	}
-	return
+	return wi
 }
 
 type watchItem struct {
@@ -31,10 +32,10 @@ func (wi *watchItem) Update() bool {
 
 	if err != nil {
 		if os.IsNotExist(err) {
-			if wi.LastEvent == NOEXIST {
+			if wi.LastEvent == NOTEXIST {
 				return false
 			} else if wi.LastEvent == DELETED {
-				wi.LastEvent = NOEXIST
+				wi.LastEvent = NOTEXIST
 				return false
 			} else {
 				wi.LastEvent = DELETED
@@ -52,7 +53,7 @@ func (wi *watchItem) Update() bool {
 		}
 	}
 
-	if wi.LastEvent == NOEXIST {
+	if wi.LastEvent == NOTEXIST {
 		wi.LastEvent = CREATED
 		wi.StatInfo = fi
 		return true
@@ -61,7 +62,7 @@ func (wi *watchItem) Update() bool {
 		switch wi.LastEvent {
 		case NONE, CREATED, NOPERM, INVALID:
 			wi.LastEvent = MODIFIED
-		case DELETED, NOEXIST:
+		case DELETED, NOTEXIST:
 			wi.LastEvent = CREATED
 		}
 		return true
